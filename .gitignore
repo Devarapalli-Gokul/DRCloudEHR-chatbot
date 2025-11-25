@@ -86,3 +86,10 @@ logs/
 docs/_build/
 docs/.doctrees/
 
+# Extracted PDF images
+backend/static/docs/
+backend/static/**/*.png
+backend/static/**/*.jpg
+backend/static/**/*.jpeg
+backend/static/**/*.gif
+

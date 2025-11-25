@@ -60,7 +60,7 @@ function App() {
         top_k: topK,
       });
 
-      // Replace loading message with actual answer
+      // Replace loading message with actual answer and chunks
       setMessages((prev) =>
         prev.map((msg) =>
           msg.id === loadingMessageId
@@ -68,6 +68,7 @@ function App() {
                 id: loadingMessageId,
                 role: "assistant",
                 content: result.answer_text,
+                chunks: result.chunks || [], // Include chunks with image URLs
               }
             : msg
         )
@@ -146,6 +147,7 @@ function App() {
             key={message.id}
             role={message.role}
             content={message.content}
+            chunks={message.chunks}
             isLoading={message.isLoading}
           />
         ))}

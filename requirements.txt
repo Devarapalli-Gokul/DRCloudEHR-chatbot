@@ -5,4 +5,4 @@ openai>=1.0.0
 python-dotenv
 httpx
 pydantic
-PyPDF2
+PyMuPDF
