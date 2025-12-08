@@ -1,10 +1,21 @@
 import React from "react";
 
-function ChatMessageBubble({ role, content, chunks = [], isLoading = false }) {
+function ChatMessageBubble({ role, content, chunks = [], imageUrls = [], isLoading = false }) {
   const isUser = role === "user";
 
-  // Collect all unique image URLs from chunks
+  // Collect all unique image URLs from multiple sources
   const allImageUrls = [];
+  
+  // First, use imageUrls prop if provided (from API response)
+  if (imageUrls && Array.isArray(imageUrls)) {
+    imageUrls.forEach((url) => {
+      if (url && !allImageUrls.includes(url)) {
+        allImageUrls.push(url);
+      }
+    });
+  }
+  
+  // Also check chunks as fallback
   if (chunks && Array.isArray(chunks)) {
     chunks.forEach((chunk) => {
       if (chunk.image_urls && Array.isArray(chunk.image_urls)) {

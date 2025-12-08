@@ -11,7 +11,7 @@ function App() {
     },
   ]);
   const [inputValue, setInputValue] = useState("");
-  const [topK, setTopK] = useState(5);
+  const [topK, setTopK] = useState(1);
   const [isLoading, setIsLoading] = useState(false);
   const chatEndRef = useRef(null);
   const textareaRef = useRef(null);
@@ -60,6 +60,38 @@ function App() {
         top_k: topK,
       });
 
+      // Collect image URLs from multiple sources
+      const imageUrls = [];
+      
+      // From legacy image_urls field
+      if (result.image_urls && Array.isArray(result.image_urls)) {
+        imageUrls.push(...result.image_urls);
+      }
+      
+      // From related_images field
+      if (result.related_images && Array.isArray(result.related_images)) {
+        result.related_images.forEach((img) => {
+          if (img.image_urls && Array.isArray(img.image_urls)) {
+            imageUrls.push(...img.image_urls);
+          }
+        });
+      }
+      
+      // From chunks (fallback)
+      if (result.chunks && Array.isArray(result.chunks)) {
+        result.chunks.forEach((chunk) => {
+          if (chunk.image_urls && Array.isArray(chunk.image_urls)) {
+            imageUrls.push(...chunk.image_urls);
+          }
+        });
+      }
+      
+      // Deduplicate image URLs
+      const uniqueImageUrls = [...new Set(imageUrls)];
+      
+      // Keep chunks as-is (they may have their own image_urls)
+      const chunksWithImages = result.chunks || [];
+
       // Replace loading message with actual answer and chunks
       setMessages((prev) =>
         prev.map((msg) =>
@@ -68,7 +100,8 @@ function App() {
                 id: loadingMessageId,
                 role: "assistant",
                 content: result.answer_text,
-                chunks: result.chunks || [], // Include chunks with image URLs
+                chunks: chunksWithImages,
+                imageUrls: uniqueImageUrls, // Also pass directly for easier access
               }
             : msg
         )
@@ -148,6 +181,7 @@ function App() {
             role={message.role}
             content={message.content}
             chunks={message.chunks}
+            imageUrls={message.imageUrls}
             isLoading={message.isLoading}
           />
         ))}
