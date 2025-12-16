@@ -93,3 +93,9 @@ backend/static/**/*.jpg
 backend/static/**/*.jpeg
 backend/static/**/*.gif
 
+# Configuration documentation
+backend/CONFIGURATION.md
+
+# Markdown files
+*.md
+

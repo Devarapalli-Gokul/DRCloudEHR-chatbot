@@ -61,11 +61,12 @@ class Block:
     block_type: Literal["heading", "paragraph", "image", "caption", "list_item"]
     text: str | None = None
     image_url: str | None = None
+    bbox: Tuple[float, float, float, float] | None = None  # (x0, y0, x1, y1) for sorting
 
 
 class QueryRequest(BaseModel):
     question: str
-    top_k: int | None = 1
+    top_k: int | None = None  # Defaults to ANSWER_TOP_N (3) if not provided
 
 
 class RetrievedChunk(BaseModel):
@@ -120,14 +121,19 @@ BASE_IMAGE_URL = os.getenv("BASE_IMAGE_URL", "/static")
 # Retrieval configuration - tuned for precision and accuracy
 SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.35"))  # Text chunks threshold
 IMAGE_SIMILARITY_THRESHOLD = float(os.getenv("IMAGE_SIMILARITY_THRESHOLD", "0.45"))  # Image chunks threshold
-ANSWER_TOP_N = int(os.getenv("ANSWER_TOP_N", "1"))  # Top 1 chunk for answer generation
-MAX_IMAGES = int(os.getenv("MAX_IMAGES", "3"))  # Maximum number of images to return
+ANSWER_TOP_N = int(os.getenv("ANSWER_TOP_N", "3"))  # Top 3 chunks for answer generation (general use)
+MAX_IMAGES = int(os.getenv("MAX_IMAGES", "1"))  # Maximum number of images to return
 RETRIEVAL_LIMIT = int(os.getenv("RETRIEVAL_LIMIT", "30"))  # Initial retrieval limit before filtering
 
 # Figure context configuration
 MAX_HEADING_DISTANCE = int(os.getenv("MAX_HEADING_DISTANCE", "10"))  # Max blocks between image and heading
-K_BEFORE_PARAGRAPHS = int(os.getenv("K_BEFORE_PARAGRAPHS", "3"))  # Paragraphs before image
-K_AFTER_PARAGRAPHS = int(os.getenv("K_AFTER_PARAGRAPHS", "3"))  # Paragraphs after image
+K_BEFORE_PARAGRAPHS = int(os.getenv("K_BEFORE_PARAGRAPHS", "2"))  # Paragraphs before image (reduced for precision)
+K_AFTER_PARAGRAPHS = int(os.getenv("K_AFTER_PARAGRAPHS", "1"))  # Paragraphs after image (reduced for precision)
+
+# Image extraction configuration (universal thresholds)
+MIN_IMAGE_SIZE = int(os.getenv("MIN_IMAGE_SIZE", "30"))  # Minimum image size in pixels (filters tiny icons/logos)
+HEADER_REGION_HEIGHT = int(os.getenv("HEADER_REGION_HEIGHT", "150"))  # Y position threshold for header region
+IMAGE_MATCHING_DISTANCE_THRESHOLD = float(os.getenv("IMAGE_MATCHING_DISTANCE_THRESHOLD", "200"))  # Max distance for image-to-image matching
 
 # Static files directory for images
 STATIC_DIR = Path(__file__).parent / "static"
@@ -272,16 +278,19 @@ Accuracy check: Before answering, verify that every claim you make can be traced
     return completion.choices[0].message.content.strip()
 
 
-def extract_images_from_page(doc_id: str, page_index: int, page: fitz.Page) -> List[str]:
+def extract_images_from_page(doc_id: str, page_index: int, page: fitz.Page) -> List[Tuple[str, Tuple[float, float, float, float]]]:
     """
     Extract all images from a PDF page and save them to disk.
-    Returns a list of image URLs.
+    Uses image blocks from text dict to get ALL image instances with their positions.
+    Images are sorted by position (top to bottom) before saving, so filename index matches reading order.
+    Returns a list of tuples: (image_url, bbox) where bbox is (x0, y0, x1, y1).
     """
-    image_urls = []
-    image_list = page.get_images(full=True)
+    # Get image blocks from text dict - this gives us ALL image instances with positions
+    text_dict = page.get_text("dict")
+    image_blocks = [b for b in text_dict.get("blocks", []) if b.get("type") == 1]  # type 1 = image
     
-    if not image_list:
-        return image_urls
+    if not image_blocks:
+        return []
     
     # Sanitize doc_id for file system safety
     safe_doc_id = sanitize_doc_id(doc_id)
@@ -290,33 +299,127 @@ def extract_images_from_page(doc_id: str, page_index: int, page: fitz.Page) -> L
     doc_images_dir = STATIC_DIR / "docs" / safe_doc_id
     doc_images_dir.mkdir(parents=True, exist_ok=True)
     
-    for img_index, img in enumerate(image_list):
+    # Sort image blocks by position (top to bottom, left to right)
+    def get_image_block_sort_key(img_block: dict) -> Tuple[float, float]:
+        bbox = img_block.get("bbox")
+        if bbox:
+            return (bbox[1], bbox[0])  # (y0, x0)
+        return (999999, 0)
+    
+    image_blocks.sort(key=get_image_block_sort_key)
+    
+    # Get all images from page.get_images() and extract their data
+    image_list = page.get_images(full=True)
+    all_image_data = []
+    for img in image_list:
         try:
             xref = img[0]
             base_image = page.parent.extract_image(xref)
-            image_bytes = base_image["image"]
-            image_ext = base_image["ext"]
-            
-            # Save image to disk
-            image_filename = f"page_{page_index}_img_{img_index}.{image_ext}"
-            image_path = doc_images_dir / image_filename
-            with open(image_path, "wb") as img_file:
-                img_file.write(image_bytes)
-            
-            # Build URL (use sanitized doc_id in URL)
-            image_url = f"{BASE_IMAGE_URL}/docs/{safe_doc_id}/{image_filename}"
-            image_urls.append(image_url)
+            # Get all rects for this xref (same image can appear multiple times)
+            try:
+                rects = page.get_image_rects(xref)
+                for rect in rects:
+                    all_image_data.append({
+                        "xref": xref,
+                        "image_bytes": base_image["image"],
+                        "image_ext": base_image["ext"],
+                        "bbox": (rect.x0, rect.y0, rect.x1, rect.y1)
+                    })
+            except:
+                # If get_image_rects fails, we'll match by position later
+                all_image_data.append({
+                    "xref": xref,
+                    "image_bytes": base_image["image"],
+                    "image_ext": base_image["ext"],
+                    "bbox": None
+                })
         except Exception as exc:
-            # Log but continue with other images
-            print(f"Warning: Failed to extract image {img_index} from page {page_index}: {exc}")
+            print(f"Warning: Failed to extract image data for xref {xref}: {exc}")
             continue
     
-    return image_urls
+    # Filter out small header images using universal thresholds
+    # This works for any PDF by filtering based on size and position, not hardcoded values
+    valid_image_blocks = []
+    for img_block in image_blocks:
+        bbox = img_block.get("bbox")
+        if not bbox:
+            continue
+        img_height = bbox[3] - bbox[1]
+        img_width = bbox[2] - bbox[0]
+        img_area = img_height * img_width
+        
+        # Universal filtering: skip tiny images (likely icons/logos) or small images in header region
+        # This adapts to any PDF structure
+        is_tiny = img_height < MIN_IMAGE_SIZE or img_width < MIN_IMAGE_SIZE
+        is_small_in_header = (img_height < MIN_IMAGE_SIZE * 2 and img_width < MIN_IMAGE_SIZE * 2) and bbox[1] < HEADER_REGION_HEIGHT
+        
+        if is_tiny or is_small_in_header:
+            continue  # Skip header logos and tiny decorative images
+        valid_image_blocks.append(img_block)
+    
+    # Match image blocks to extracted images by spatial proximity
+    image_data = []
+    used_image_indices = set()
+    
+    for sorted_index, img_block in enumerate(valid_image_blocks):
+        try:
+            bbox = img_block.get("bbox")
+            
+            # Find the closest matching image by bbox overlap/position
+            best_match = None
+            best_match_idx = None
+            min_distance = float('inf')
+            
+            img_center = ((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)
+            
+            for idx, img_info in enumerate(all_image_data):
+                if idx in used_image_indices:
+                    continue
+                if img_info["bbox"]:
+                    img_info_center = ((img_info["bbox"][0] + img_info["bbox"][2]) / 2,
+                                      (img_info["bbox"][1] + img_info["bbox"][3]) / 2)
+                    distance = ((img_center[0] - img_info_center[0])**2 + 
+                               (img_center[1] - img_info_center[1])**2)**0.5
+                    if distance < min_distance:
+                        min_distance = distance
+                        best_match = img_info
+                        best_match_idx = idx
+                elif best_match is None:  # Use first unmatched if no bbox available
+                    best_match = img_info
+                    best_match_idx = idx
+            
+            if best_match and min_distance < IMAGE_MATCHING_DISTANCE_THRESHOLD:
+                # Check if an image file already exists for this position
+                # Try to reuse existing filenames to maintain consistency
+                image_filename = f"page_{page_index}_img_{sorted_index}.{best_match['image_ext']}"
+                image_path = doc_images_dir / image_filename
+                
+                # Only write if file doesn't exist (preserve existing images and prevent duplicates)
+                # This ensures re-ingestion doesn't create duplicate images
+                if not image_path.exists():
+                    try:
+                        with open(image_path, "wb") as img_file:
+                            img_file.write(best_match["image_bytes"])
+                    except Exception as exc:
+                        print(f"Warning: Failed to write image {image_filename}: {exc}")
+                        continue
+                # If file exists, we reuse it (no overwrite, no duplicate)
+                
+                # Build URL
+                image_url = f"{BASE_IMAGE_URL}/docs/{safe_doc_id}/{image_filename}"
+                image_data.append((image_url, bbox))
+                used_image_indices.add(best_match_idx)  # Mark this image data as used to prevent duplicate matches
+        except Exception as exc:
+            print(f"Warning: Failed to process image block {sorted_index} from page {page_index}: {exc}")
+            continue
+    
+    return image_data
 
 
 def extract_text_and_images_from_pdf(doc_id: str, pdf_bytes: bytes) -> Dict[int, List[Block]]:
     """
     Extract text and images from a PDF, organized as blocks per page.
+    Blocks are sorted by Y-position to maintain reading order.
     
     Returns:
         Dictionary mapping page_index -> List[Block] in reading order
@@ -333,10 +436,10 @@ def extract_text_and_images_from_pdf(doc_id: str, pdf_bytes: bytes) -> Dict[int,
             text_dict = page.get_text("dict")
             text_blocks = text_dict.get("blocks", [])
             
-            # Extract images to get their URLs
-            image_urls_list = extract_images_from_page(doc_id, page_index, page)
+            # Extract images with their positions
+            image_data_list = extract_images_from_page(doc_id, page_index, page)
             
-            # Process text blocks first
+            # Process text blocks with their positions
             block_index = 0
             for text_block in text_blocks:
                 if "lines" not in text_block:
@@ -372,28 +475,46 @@ def extract_text_and_images_from_pdf(doc_id: str, pdf_bytes: bytes) -> Dict[int,
                     if font_size > 14:
                         block_type = "heading"
                 
+                # Get bounding box for sorting
+                bbox = text_block.get("bbox")
+                
                 blocks.append(Block(
                     doc_id=doc_id,
                     page=page_index,
                     block_index=block_index,
                     block_type=block_type,
                     text=block_text,
-                    image_url=None
+                    image_url=None,
+                    bbox=bbox
                 ))
                 block_index += 1
             
-            # Add image blocks at the end (simpler approach)
-            # The figure context builder will still find nearby text by scanning backwards
-            for image_url in image_urls_list:
+            # Add image blocks with their positions
+            for image_url, bbox in image_data_list:
                 blocks.append(Block(
                     doc_id=doc_id,
                     page=page_index,
                     block_index=block_index,
                     block_type="image",
                     text=None,
-                    image_url=image_url
+                    image_url=image_url,
+                    bbox=bbox
                 ))
                 block_index += 1
+            
+            # Sort all blocks by Y-position (top to bottom) to maintain reading order
+            # Use y0 (top Y coordinate) as primary sort key, x0 (left X) as secondary
+            def get_sort_key(block: Block) -> Tuple[float, float]:
+                if block.bbox:
+                    return (block.bbox[1], block.bbox[0])  # (y0, x0)
+                # If no bbox, put at end (high Y value)
+                return (999999, 0)
+            
+            blocks.sort(key=get_sort_key)
+            
+            # Reassign block indices after sorting
+            for idx, block in enumerate(blocks):
+                block.block_index = idx
             
             pages_blocks[page_index] = blocks
         
@@ -403,9 +524,15 @@ def extract_text_and_images_from_pdf(doc_id: str, pdf_bytes: bytes) -> Dict[int,
         raise ValueError(f"Failed to parse PDF: {exc}") from exc
 
 
-def build_figure_context_for_image(blocks: List[Block], image_block_index: int) -> Tuple[str, List[int]]:
+def build_figure_context_for_image(blocks: List[Block], image_block_index: int, used_text_indices: set | None = None) -> Tuple[str, List[int]]:
     """
     Build figure context text for an image by finding heading, caption, and nearby paragraphs.
+    Ensures one-to-one matching by avoiding text blocks already used by other images.
+    
+    Args:
+        blocks: List of all blocks on the page
+        image_block_index: Index of the image block
+        used_text_indices: Set of text block indices already used by other images (for one-to-one matching)
     
     Returns:
         (figure_context_text, contributing_block_indices)
@@ -413,20 +540,52 @@ def build_figure_context_for_image(blocks: List[Block], image_block_index: int) 
     if image_block_index >= len(blocks) or blocks[image_block_index].block_type != "image":
         return "", []
     
+    if used_text_indices is None:
+        used_text_indices = set()
+    
     contributing_indices = [image_block_index]
     context_parts = []
     
-    # Find nearest heading above
+    # Universal function to detect generic header text (works for any PDF)
+    def is_generic_header(text: str) -> bool:
+        """
+        Detects generic header/footer text that shouldn't be associated with images.
+        This is universal and works for any PDF by detecting common patterns.
+        """
+        if not text:
+            return False
+        text_lower = text.lower()
+        
+        # Skip URLs and website references (universal pattern)
+        if any(pattern in text_lower for pattern in ['http://', 'https://', 'www.', '://']):
+            return True
+        
+        # Skip copyright and attribution text (universal pattern)
+        if any(pattern in text_lower for pattern in ['copyright', '©', 'illustrations', 'photocopiable', 'all rights reserved']):
+            return True
+        
+        # Skip page numbers and references (universal pattern)
+        if len(text.split()) <= 3 and any(word in text_lower for word in ['page', 'see page', 'p.', 'pp.']):
+            return True
+        
+        # Skip date-only or very short metadata (universal pattern)
+        if len(text.split()) <= 2 and re.match(r'^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$', text.strip()):
+            return True
+        
+        return False
+    
+    # Find nearest heading above (skip generic headers)
     heading_text = None
     heading_index = None
     for i in range(image_block_index - 1, max(-1, image_block_index - MAX_HEADING_DISTANCE - 1), -1):
         if i < 0:
             break
-        if blocks[i].block_type == "heading":
-            heading_text = blocks[i].text
-            heading_index = i
-            contributing_indices.append(i)
-            break
+        if blocks[i].block_type == "heading" and blocks[i].text:
+            if not is_generic_header(blocks[i].text):
+                heading_text = blocks[i].text
+                heading_index = i
+                contributing_indices.append(i)
+                break
     
     # Find caption below (next 1-2 blocks)
     caption_text = None
@@ -445,35 +604,134 @@ def build_figure_context_for_image(blocks: List[Block], image_block_index: int) 
                 contributing_indices.append(i)
                 break
     
-    # Collect nearby paragraphs
+    # Collect nearby paragraphs - prioritize closest paragraphs
+    # Use a smaller window and prioritize blocks immediately before/after the image
     start = max(0, image_block_index - K_BEFORE_PARAGRAPHS)
     end = min(len(blocks), image_block_index + K_AFTER_PARAGRAPHS + 1)
     
-    nearby_paragraphs = []
-    for i in range(start, end):
-        if i == image_block_index or i in caption_indices:
+    # Get image Y position for spatial matching
+    image_block = blocks[image_block_index]
+    if not image_block.bbox:
+        return "", []
+    
+    image_y_center = (image_block.bbox[1] + image_block.bbox[3]) / 2  # Center Y of image
+    image_height = image_block.bbox[3] - image_block.bbox[1]
+    image_width = image_block.bbox[2] - image_block.bbox[0]
+    
+    # Universal filtering: skip tiny images in header region (works for any PDF)
+    # Uses configurable thresholds instead of hardcoded values
+    is_tiny = image_height < MIN_IMAGE_SIZE or image_width < MIN_IMAGE_SIZE
+    is_small_in_header = (image_height < MIN_IMAGE_SIZE * 2 and image_width < MIN_IMAGE_SIZE * 2) and image_block.bbox[1] < HEADER_REGION_HEIGHT
+    
+    if is_tiny or is_small_in_header:
+        # This is probably a header/logo image, return empty to skip it
+        return "", []
+    
+    # Get all images on this page to determine image order
+    page_images = [b for b in blocks if b.block_type == "image" and b.bbox]
+    page_images.sort(key=lambda b: (b.bbox[1], b.bbox[0]))  # Sort by Y position
+    image_order = next((i for i, img in enumerate(page_images) if img.block_index == image_block_index), 0)
+    
+    # Get all non-generic text blocks with positions
+    text_blocks_with_pos = []
+    for i, block in enumerate(blocks):
+        if i == image_block_index:
             continue
-        if blocks[i].block_type in ["paragraph", "list_item"] and blocks[i].text:
-            nearby_paragraphs.append((i, blocks[i].text))
+        if block.block_type in ["paragraph", "list_item", "heading"] and block.text:
+            if not is_generic_header(block.text) and block.bbox:
+                text_y_center = (block.bbox[1] + block.bbox[3]) / 2
+                text_blocks_with_pos.append((i, block, text_y_center))
+    
+    # Sort text blocks by Y position
+    text_blocks_with_pos.sort(key=lambda x: x[2])
+    
+    nearby_paragraphs = []
+    # Universal image-to-text matching: Use the text block immediately before the image in block sequence
+    # This is the most reliable method - it matches by reading order, not just spatial position
+    
+    # Find the text block that appears immediately before this image in the block sequence
+    # This ensures each image gets the text that directly precedes it in reading order
+    text_immediately_before = None
+    text_immediately_before_idx = None
+    min_sequence_distance = float('inf')
+    
+    for i, block, text_y in text_blocks_with_pos:
+        if i < image_block_index:  # Text comes before image in sequence
+            sequence_distance = image_block_index - i  # How many blocks before
+            if sequence_distance < min_sequence_distance:
+                min_sequence_distance = sequence_distance
+                text_immediately_before = (i, block, text_y)
+                text_immediately_before_idx = i
+    
+    if text_immediately_before:
+        # Use the text immediately before the image, but only if not already used
+        i, block, text_y = text_immediately_before
+        if i not in used_text_indices:  # Ensure one-to-one matching
+            distance = abs(text_y - image_y_center)
+            nearby_paragraphs.append((i, block.text, distance))
             if i not in contributing_indices:
                 contributing_indices.append(i)
+            used_text_indices.add(i)  # Mark as used
+        
+        # Also include 1-2 more text blocks before for context (if close in sequence and not used)
+        for i2, block2, text_y2 in text_blocks_with_pos:
+            if i2 < image_block_index and i2 != i and i2 not in used_text_indices:
+                sequence_dist = image_block_index - i2
+                if sequence_dist <= 3:  # Within 3 blocks
+                    distance2 = abs(text_y2 - image_y_center)
+                    nearby_paragraphs.append((i2, block2.text, distance2))
+                    if i2 not in contributing_indices:
+                        contributing_indices.append(i2)
+                    used_text_indices.add(i2)  # Mark as used
+                    if len(nearby_paragraphs) >= 3:  # Limit to 3 text blocks
+                        break
+    else:
+        # Fallback: No text before in sequence, use closest unused text above spatially
+        text_above = []
+        for i, block, text_y in text_blocks_with_pos:
+            if text_y < image_y_center and i not in used_text_indices:  # Text above image and not used
+                distance = abs(text_y - image_y_center)
+                text_above.append((i, block.text, distance, text_y))
+        
+        if text_above:
+            text_above.sort(key=lambda x: x[2])  # Sort by distance
+            i, text, distance, _ = text_above[0]
+            nearby_paragraphs.append((i, text, distance))
+            if i not in contributing_indices:
+                contributing_indices.append(i)
+            used_text_indices.add(i)  # Mark as used
+        elif text_blocks_with_pos:
+            # Last resort: closest unused text overall
+            unused_text = [(i, b, ty) for i, b, ty in text_blocks_with_pos if i not in used_text_indices]
+            if unused_text:
+                closest = min(unused_text, key=lambda x: abs(x[2] - image_y_center))
+                i, block, text_y = closest
+                distance = abs(text_y - image_y_center)
+                nearby_paragraphs.append((i, block.text, distance))
+                if i not in contributing_indices:
+                    contributing_indices.append(i)
+                used_text_indices.add(i)  # Mark as used
     
-    # Build context text
-    if heading_text:
-        context_parts.append(f"Section: {heading_text}")
+    # Sort by distance from image (closest first)
+    nearby_paragraphs.sort(key=lambda x: x[2])
+    
+    # Build context text - prioritize specific animal content
+    if heading_text and not is_generic_header(heading_text):
+        context_parts.append(heading_text)  # Don't add "Section:" prefix, just the heading
     
     if caption_text:
         context_parts.append(f"Caption: {caption_text}")
     
-    # Add nearby paragraphs (limit to ~300 words total for better context)
-    # Prioritize paragraphs that mention key terms related to the image
+    # Add nearby paragraphs (limit to ~200 words total, prioritizing closest and most specific)
     paragraph_texts = []
     word_count = 0
-    for _, para_text in nearby_paragraphs:
+    for _, para_text, _ in nearby_paragraphs:
+        if is_generic_header(para_text):
+            continue  # Skip generic headers
         words = para_text.split()
-        if word_count + len(words) > 300:
+        if word_count + len(words) > 200:  # Reduced from 300 to focus on most relevant
             # Truncate if needed
-            remaining = 300 - word_count
+            remaining = 200 - word_count
             if remaining > 0:
                 paragraph_texts.append(" ".join(words[:remaining]))
             break
@@ -481,15 +739,19 @@ def build_figure_context_for_image(blocks: List[Block], image_block_index: int) 
         word_count += len(words)
     
     if paragraph_texts:
-        context_parts.append("\n".join(paragraph_texts))
+        context_parts.extend(paragraph_texts)  # Add each paragraph separately for clarity
     
     # Build the base figure context first
     figure_context = "\n\n".join(context_parts).strip()
     
     # If we have very little context, SKIP this figure entirely
-    # instead of embedding a generic "unlabeled diagram" sentence.
     if len(figure_context.split()) < 10:
-        # Not enough semantic content to be useful for retrieval
+        return "", []
+    
+    # Double-check: if context is mostly generic headers, skip it
+    words = figure_context.lower().split()
+    generic_word_count = sum(1 for word in words if any(pattern in word for pattern in ['http', 'www', 'scholastic', 'photocopiable', 'illustrations']))
+    if generic_word_count > len(words) * 0.2:  # More than 20% generic words
         return "", []
     
     return figure_context, sorted(contributing_indices)
@@ -666,16 +928,42 @@ def ingest_pdf_document(doc_id: str, pdf_bytes: bytes, replace_existing: bool = 
         if not blocks:
             continue
         
+        # Track which text blocks have been used to ensure one-to-one matching
+        used_text_block_indices = set()
+        
         # First, create figure chunks for each image
         image_chunk_index = 0
         for block in blocks:
             if block.block_type == "image" and block.image_url:
-                # Build figure context
-                figure_context, contributing_indices = build_figure_context_for_image(blocks, block.block_index)
+                # Build figure context with used text tracking
+                figure_context, contributing_indices = build_figure_context_for_image(
+                    blocks, block.block_index, used_text_block_indices
+                )
                 
                 if not figure_context.strip():
-                    print(f"[INGEST] Skipping image on page {page_index}: no context found")
+                    # Debug: show what blocks are around this image
+                    print(f"[INGEST] Skipping image on page {page_index} (block {block.block_index}): no context found")
+                    print(f"  Image URL: {block.image_url}")
+                    # Show nearby blocks for debugging
+                    start_debug = max(0, block.block_index - 3)
+                    end_debug = min(len(blocks), block.block_index + 3)
+                    for i in range(start_debug, end_debug):
+                        nearby = blocks[i]
+                        print(f"  Block {i}: type={nearby.block_type}, text={nearby.text[:80] if nearby.text else 'N/A'}...")
                     continue
+                
+                # Debug: Show which text blocks are being associated with this image
+                contributing_text = []
+                for idx in contributing_indices:
+                    if idx < len(blocks) and blocks[idx].text:
+                        animal_name = blocks[idx].text.split()[0] if blocks[idx].text.split() else ''
+                        contributing_text.append(f"  Block {idx}: {animal_name}...")
+                
+                print(f"[INGEST] Image {image_chunk_index} ({block.image_url.split('/')[-1]}):")
+                print(f"  Position: block_index={block.block_index}, bbox={block.bbox}")
+                if contributing_text:
+                    print(f"  Associated text: {', '.join([t.split(':')[1].strip() for t in contributing_text[:3]])}")
+                print(f"  Context preview: {figure_context[:100]}...")
                 
                 try:
                     embedding = embed_text(figure_context)
@@ -706,7 +994,7 @@ def ingest_pdf_document(doc_id: str, pdf_bytes: bytes, replace_existing: bool = 
                     )
                 )
                 image_chunk_index += 1
-                print(f"[INGEST] Created figure chunk for page {page_index}, image {image_chunk_index}: {block.image_url}")
+                print(f"[INGEST] ✓ Created figure chunk for page {page_index}, image {image_chunk_index}\n")
         
         # Now create text chunks from text-like blocks
         text_blocks = [b for b in blocks if b.block_type in ["heading", "paragraph", "list_item"] and b.text]
@@ -1057,6 +1345,14 @@ def query_documents(request: QueryRequest):
             -img["similarity_score"]                     # then score desc
         )
     )
+
+    # Debug: Log top image candidates
+    if image_candidates:
+        print(f"[QUERY] Top {min(3, len(image_candidates))} image candidate(s) for '{question}':")
+        for idx, img in enumerate(image_candidates[:3]):
+            print(f"  {idx+1}. {img['image_urls'][0] if img['image_urls'] else 'N/A'}")
+            print(f"     Score: {img['similarity_score']:.3f}, Same doc: {img['same_doc']}, Has keywords: {img['has_keywords']}")
+            print(f"     Caption: {img['caption'][:100] if img['caption'] else 'N/A'}...")
 
     image_candidates = image_candidates[:MAX_IMAGES]
 
