@@ -646,38 +646,35 @@ def build_figure_context_for_image(blocks: List[Block], image_block_index: int, 
     text_blocks_with_pos.sort(key=lambda x: x[2])
     
     nearby_paragraphs = []
-    # Universal image-to-text matching: Use the text block immediately before the image in block sequence
-    # This is the most reliable method - it matches by reading order, not just spatial position
+    # Universal image-to-text matching: Use the text block immediately before the image in reading order
+    # This is the most reliable method - it matches by reading order (block sequence), ensuring correct association
     
-    # Find the text block that appears immediately before this image in the block sequence
+    # Strategy 1: Find the text block that appears immediately before this image in the block sequence
     # This ensures each image gets the text that directly precedes it in reading order
     text_immediately_before = None
-    text_immediately_before_idx = None
     min_sequence_distance = float('inf')
     
     for i, block, text_y in text_blocks_with_pos:
-        if i < image_block_index:  # Text comes before image in sequence
+        if i < image_block_index and i not in used_text_indices:  # Text comes before image in sequence and not used
             sequence_distance = image_block_index - i  # How many blocks before
             if sequence_distance < min_sequence_distance:
                 min_sequence_distance = sequence_distance
                 text_immediately_before = (i, block, text_y)
-                text_immediately_before_idx = i
     
     if text_immediately_before:
-        # Use the text immediately before the image, but only if not already used
+        # Use the text immediately before the image
         i, block, text_y = text_immediately_before
-        if i not in used_text_indices:  # Ensure one-to-one matching
-            distance = abs(text_y - image_y_center)
-            nearby_paragraphs.append((i, block.text, distance))
-            if i not in contributing_indices:
-                contributing_indices.append(i)
-            used_text_indices.add(i)  # Mark as used
+        distance = abs(text_y - image_y_center)
+        nearby_paragraphs.append((i, block.text, distance))
+        if i not in contributing_indices:
+            contributing_indices.append(i)
+        used_text_indices.add(i)  # Mark as used
         
         # Also include 1-2 more text blocks before for context (if close in sequence and not used)
         for i2, block2, text_y2 in text_blocks_with_pos:
             if i2 < image_block_index and i2 != i and i2 not in used_text_indices:
                 sequence_dist = image_block_index - i2
-                if sequence_dist <= 3:  # Within 3 blocks
+                if sequence_dist <= 2:  # Within 2 blocks
                     distance2 = abs(text_y2 - image_y_center)
                     nearby_paragraphs.append((i2, block2.text, distance2))
                     if i2 not in contributing_indices:
@@ -686,22 +683,23 @@ def build_figure_context_for_image(blocks: List[Block], image_block_index: int, 
                     if len(nearby_paragraphs) >= 3:  # Limit to 3 text blocks
                         break
     else:
-        # Fallback: No text before in sequence, use closest unused text above spatially
+        # Strategy 2: No text before in sequence, find closest unused text above spatially
         text_above = []
         for i, block, text_y in text_blocks_with_pos:
             if text_y < image_y_center and i not in used_text_indices:  # Text above image and not used
                 distance = abs(text_y - image_y_center)
-                text_above.append((i, block.text, distance, text_y))
+                text_above.append((i, block, text_y, distance))
         
         if text_above:
-            text_above.sort(key=lambda x: x[2])  # Sort by distance
-            i, text, distance, _ = text_above[0]
-            nearby_paragraphs.append((i, text, distance))
+            # Sort by distance (closest first)
+            text_above.sort(key=lambda x: x[3])
+            i, block, text_y, distance = text_above[0]
+            nearby_paragraphs.append((i, block.text, distance))
             if i not in contributing_indices:
                 contributing_indices.append(i)
             used_text_indices.add(i)  # Mark as used
-        elif text_blocks_with_pos:
-            # Last resort: closest unused text overall
+        else:
+            # Strategy 3: Last resort - closest unused text overall (spatially)
             unused_text = [(i, b, ty) for i, b, ty in text_blocks_with_pos if i not in used_text_indices]
             if unused_text:
                 closest = min(unused_text, key=lambda x: abs(x[2] - image_y_center))
@@ -932,9 +930,12 @@ def ingest_pdf_document(doc_id: str, pdf_bytes: bytes, replace_existing: bool = 
         used_text_block_indices = set()
         
         # First, create figure chunks for each image
+        # Process images in Y-position order (top to bottom) to ensure correct matching
+        image_blocks = [b for b in blocks if b.block_type == "image" and b.image_url and b.bbox]
+        image_blocks.sort(key=lambda b: (b.bbox[1], b.bbox[0]))  # Sort by Y position, then X
+        
         image_chunk_index = 0
-        for block in blocks:
-            if block.block_type == "image" and block.image_url:
+        for block in image_blocks:
                 # Build figure context with used text tracking
                 figure_context, contributing_indices = build_figure_context_for_image(
                     blocks, block.block_index, used_text_block_indices
